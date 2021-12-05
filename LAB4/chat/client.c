@@ -1,108 +1,123 @@
 #include <stdio.h>
-#include <sys/socket.h>
+#include <stdio_ext.h>
 #include <stdlib.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <pthread.h>
+#include <signal.h>
 
-#define PORT 8080
-#define DATA_LENGHT 1024
+#define PORT 3232              // default port number
+#define MAXDATALEN 256
 
-void* threading(void * client_socket);
+int sockfd;
+int n;                        /*variables for socket*/
+struct sockaddr_in serv_addr; /* structure to hold server's address */
+char buffer[MAXDATALEN];
+char buf[10];
 
-int main(int argc, char const *argv[]) {
+void *quit();
+void *chat_write(int);
+void *chat_read(int);
 
-int sock = 0, valread;
-struct sockaddr_in serv_addr;
-char buffer[DATA_LENGHT] = {0};
-
-if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-	printf("\n Socket creation error \n");
-	return -1;
-}
-
-// sets all memory cells to zero
-memset(&serv_addr, '0', sizeof(serv_addr));
-
-// sets port and address family
-serv_addr.sin_family = AF_INET;
-serv_addr.sin_port = htons(atoi(argv[2]));
-
-// Convert IPv4 and IPv6 addresses from text to binary form
-if(inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0)
+int main(int argc, char *argv[])
 {
-	printf("\nInvalid address/ Address not supported \n");
-	return -1;
+
+    pthread_t thr1, thr2; /* variable to hold thread ID */
+
+    if (argc != 4)
+    {
+        printf("Please enter server ip, port and your username.\n");
+        exit(1);
+    }
+
+    // socket creating
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1)
+        printf("client socket error\n");
+    else
+        printf("socket created\n");
+
+    // set info
+    bzero((char *)&serv_addr, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT);
+    serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
+
+    // username
+    bzero(buf, 10);
+    strcpy(buf, argv[3]);
+    buf[strlen(buf)] = ':';
+
+    // client connect to server
+    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1)
+    {
+        printf("client connect error\n");
+        exit(0);
+    }
+    else
+        printf("\rYOU JOINED AS %s\n", buf);
+
+    send(sockfd, buf, strlen(buf), 0);
+
+    pthread_create(&thr2, NULL, (void *)chat_write, (void *) (intptr_t) sockfd); //thread for writing
+    pthread_create(&thr1, NULL, (void *)chat_read, (void *) (intptr_t) sockfd);  //thread for reading
+
+    pthread_join(thr2, NULL);
+    pthread_join(thr1, NULL);
+
+    return 0;
+
 }
 
-// connects to the server
-if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+void *chat_read(int sockfd)
 {
-	printf("\nConnection Failed \n");
-	return -1;
+    signal(SIGINT,(void *)quit);
+    while (1)
+    {
+        n = recv(sockfd, buffer, MAXDATALEN - 1, 0);
+        if (n == 0)
+        {
+            printf("\n==== SERVER HAS BEEN SHUTDOWN ====\n");
+            exit(0);
+        }
+
+        if (n > 0)
+        {
+            printf("-> %s", buffer);
+            bzero(buffer, MAXDATALEN);
+        }
+    }
 }
 
-// create thread that listens to server
-pthread_t thread;
-pthread_create(&thread, NULL, threading, (void *)&sock);
+void *chat_write(int sockfd)
+{
+    while (1)
+    {
+        // printf("%s", buf);
+        fgets(buffer, MAXDATALEN - 1, stdin);
 
-send(sock, argv[3], 50, 0);
+        if (strlen(buffer) - 1 > sizeof(buffer))
+        {
+            printf("buffer size full\t enter within %ld characters\n", sizeof(buffer));
+            bzero(buffer, MAXDATALEN);
+            __fpurge(stdin);
+        }
 
-while(1){
+        n = send(sockfd, buffer, strlen(buffer), 0);
 
-	char statement[DATA_LENGHT];
+        if (strncmp(buffer, "/quit", 5) == 0)
+            exit(0);
 
-	scanf("%s", statement);
-	send(sock, statement, DATA_LENGHT, 0);
-
-	if (!strcmp(statement, "join")){
-
-	    // take group id
-	    scanf("%s", statement);
-	    send(sock, statement, DATA_LENGHT, 0);
-	}
-	else if (!strcmp(statement, "send")){
-
-	    // take group id
-	    scanf("%s", statement);
-	    send(sock, statement, DATA_LENGHT, 0);
-
-	    // take message
-	    scanf("%[^\n]%*c", statement);
-	    send(sock, statement, DATA_LENGHT, 0);
-	}
-	else if (!strcmp(statement, "leave")){
-
-    	// take group id
-    	scanf("%s", statement);
-	    send(sock, statement, DATA_LENGHT, 0);
-	}
-	else if (!strcmp(statement, "quit")){
-
-	    printf("Ending connection...\n");
-	    pthread_cancel(thread);
-	    shutdown(sock,2);
-	    return 0;
-	}
+        bzero(buffer, MAXDATALEN);
+    }
 }
 
-return 0;
-	
-}
-
-void* threading(void * client_socket){
-
-	int clientSocket = *((int *)client_socket);
-	while(1){
-		char buffer[1024] = {0};
-		int valread = read(clientSocket, buffer, 1024);
-		buffer[valread] = '\0';
-
-		if (valread < 0) {
-			perror("read");
-		}
-		printf("%s\n", buffer);
-	}
+// handling SIGINT
+void *quit()
+{
+    printf("\nType '/quit' TO EXIT\n");
 }

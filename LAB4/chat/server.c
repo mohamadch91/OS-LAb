@@ -1,190 +1,306 @@
-#include <unistd.h>
 #include <stdio.h>
-#include <sys/socket.h>
 #include <stdlib.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <string.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <signal.h>
 
-#define PORT 8080
-#define GROUP_NUMBERS 10
-#define CLIENT_NUMBERS 10
-#define DATA_LENGHT 1024
-pthread_t thread[50];
+#define BACKLOG 100    // connections in the queue
+#define MAXDATALEN 256 // max size of messages to be sent
+#define MAXUSER 20     // max number of users
+#define MAXGROUP 10    // max number of groups
+#define PORT 3232      // default port number
 
-struct client{
+typedef struct
+{
+    int port;
+    char username[10];
+} User;
 
-	int port;
-	int id;
-	int socket;
-	struct sockaddr_in address;
-	char name[50];
-	int last_group_index;
-	int groups[GROUP_NUMBERS];
-};
-struct client clients[CLIENT_NUMBERS];
+void *server(void *arg);                                           /*server instance for every connected client*/
+void insert_list(int port, char *username, User *list, int *tail); /*inserting new client */
+int search_list(int port, User *list, int tail);
+void delete_list(int port, User *list, int *tail);
+void delete_all(User *list, int *tail);
+void display_list(const User *list, int tail); /*list all clients connected*/
+void notify_shutdown();                        /*send msg to all if server shuts down*/
+void *quit_signal();                           /*signal handler*/
+int next_space(char *str);
 
-void* client_threading(void * ClientInfo);
+char username[10];
+User users[MAXUSER] = {0};
+int user_tail = 0;
+User groups[MAXGROUP][MAXUSER] = {0};
+int group_tail[MAXUSER] = {0};
+char buffer[MAXDATALEN];
 
-int main(int argc, char const *argv[]) {
+int main(int argc, char *argv[])
+{
 
-	// creates socket file descriptor
-	int server_fd;
-	server_fd = socket(PF_INET, SOCK_STREAM, 0);
-	if (server_fd == 0) {
-		perror("socket failed");
-		exit(EXIT_FAILURE);
-	}
+    int sockfd, new_fd;
+    int portnum;
+    struct sockaddr_in server_addr;
+    struct sockaddr_in client_addr;
+    int cli_size, z;
+    pthread_t thr;
+    int yes = 1;
 
-	struct sockaddr_in address;
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = htons(INADDR_ANY);
-	address.sin_port = htons(atoi(argv[1])); // host to network
-	const int addrlen = sizeof(address);
+    printf("==== Starting Server ====\n");
+    if (argc == 2)
+        portnum = atoi(argv[1]);
+    else
+        portnum = PORT; //if port number not given as argument then using default port
+    printf("PORT NO.:\t%d\n", portnum);
 
-	// binding
-	if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-		perror("bind failed");
-		exit(EXIT_FAILURE);
-	}
+    /*=set info of server =*/
+    server_addr.sin_family = AF_INET;                /* set family to Internet     */
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY); /* set IP address */
+    server_addr.sin_port = htons(portnum);
+    printf("IP ADDRESS:\t%s\n", inet_ntoa(server_addr.sin_addr));
 
-	// listening on server socket with backlog size CLIENT_NUMBERS.
-	if (listen(server_fd, CLIENT_NUMBERS) < 0) {
-		perror("listen");
-		exit(EXIT_FAILURE);
-	}
-	printf("Server is listening on %s:%d\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+    /*=creating socket=*/
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1)
+    {
+        printf("server- socket() error"); // debugging
+        exit(1);
+    }
 
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1)
+    {
+        printf("setsockopt error"); // debugging
+        exit(1);
+    }
 
-	// making a thread for each client
-	int clientID = 0;
-	while(1){
+    /*=binding socket=*/
+    if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(struct sockaddr)) == -1)
+    {
+        printf("binding failed\n"); // debugging
+        exit(1);
+    }
 
-		clients[clientID].id 	  = clientID;
-		clients[clientID].socket  = accept(server_fd, (struct sockaddr *)&clients[clientID].address, (socklen_t*)&addrlen);
-		// printf("Welcome client %s:%d\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
-		pthread_create(&thread[clientID], NULL, client_threading, (void*) &clients[clientID]);
+    /*=socket on listening mode=*/
+    listen(sockfd, BACKLOG);
+    printf("waiting for clients......\n");
 
-		clientID++;
-	}
-	return 0;
+    signal(SIGINT, (void *)quit_signal); //signal handler
+
+    // Accepting new clients
+    while (1)
+    {
+        cli_size = sizeof(struct sockaddr_in);                               //cli_size necessary as an argument for pthread_create
+        new_fd = accept(sockfd, (struct sockaddr *)&client_addr, &cli_size); //accepting connection from client
+
+        /* getting username */
+        bzero(username, 10);
+        if (recv(new_fd, username, sizeof(username), 0) > 0)
+            ;
+        username[strlen(username) - 1] = ':';
+
+        printf("** %d: %s JOINED CHAT **\n\n", new_fd, username);
+        insert_list(new_fd, username, users, &user_tail); //inserting newly accepted client socked fd in list
+
+        User args; //struct to pass multiple arguments to server function
+        args.port = new_fd;
+        strcpy(args.username, username);
+
+        pthread_create(&thr, NULL, server, (void *)&args); //creating thread for every client connected
+        pthread_detach(thr);
+    }
+
+    delete_all(users, &user_tail);
+    close(sockfd);
 }
 
-void* client_threading(void * ClientInfo){
+/* Each client thread */
+void *server(void *arguments)
+{
+    User *args = arguments;
 
-	struct client * clientInfo = (struct client*) ClientInfo;
-	int id = clientInfo->id;
-	int socket = clientInfo->socket;
+    char buffer[MAXDATALEN], uname[10]; /* buffer for string the server sends */
+    char *strp;
+    char *msg = (char *)malloc(MAXDATALEN);
+    int my_port, x, y;
+    int msglen;
 
-	clients[id].last_group_index = 0;
+    my_port = args->port; /*socket variable passed as arg*/
+    strcpy(uname, args->username);
 
-	char client_name[DATA_LENGHT];
-	int name_read = recv(socket, client_name, DATA_LENGHT, 0);
-	client_name[name_read] = '\0';
-	// clients[id].name = client_name;
-	strcpy(clients[id].name, client_name);
-	char final_message[DATA_LENGHT];
-	printf("%s has connected to server with id: %d\n", clients[id].name,id);
+    // Handling messages
+    while (1)
+    {
+        bzero(buffer, 256);
+        y = recv(my_port, buffer, MAXDATALEN, 0);
 
-	
-	while(1){
-		// reads a buffer with maximum size 1024 (DATA_LENGHT) from socket.
-		char buffer[DATA_LENGHT];
-		int valread = recv(socket, buffer, DATA_LENGHT, 0);
-		buffer[valread] = '\0';
-		if (valread < 0) {
-			perror("read");
-			exit(EXIT_FAILURE);
-		}
-		// printf("(s = %d) %s\n", valread, buffer);
+        /* Client quits */
+        if (!y || strncmp(buffer, "/quit", 5) == 0)
+        {
+            printf("** %d: %s left chat. Deleting from lists. **\n\n", my_port, uname);
 
-		if (!strcmp(buffer, "quit")){
+            delete_list(my_port, users, &user_tail);
+            for (int i = 0; i < MAXGROUP; i++)
+            {
+                delete_list(my_port, groups[i], &group_tail[i]);
+            }
 
-			printf("%s has left...\n", clients[id].name);
-			pthread_cancel(thread[id]);
-			shutdown(clients[id].socket,2);
-		}
-		else if (!strcmp(buffer, "join")){
+            display_list(users, user_tail);
 
-			
-			valread = recv(socket, buffer,DATA_LENGHT, 0);
-			buffer[valread] = '\0';
-			int exist = 0;
-			for (int i = 0; i < clients[id].last_group_index+1; i++){
-				if(clients[id].groups[i] == atoi(buffer))
-					exist = 1;
-			}
-			if(exist == 0){
-				clients[id].groups[clients[id].last_group_index+1] = atoi(buffer);
-				clients[id].last_group_index++;
-			}
-			
-		}
-		else if (!strcmp(buffer, "send")){
+            close(my_port);
+            free(msg);
 
-			// read group id
-			valread = recv(socket, buffer,DATA_LENGHT, 0);
-			buffer[valread] = '\0';
-			int group = atoi(buffer);
+            break;
+        }
+        else if (strncmp(buffer, "/join", 5) == 0)
+        {
+            char *group_id_str = malloc(sizeof(MAXDATALEN));
+            strcpy(group_id_str, buffer + 6);
+            int group_id = atoi(group_id_str);
+            printf("** %d: %s joined group number %d. **\n\n", my_port, uname, group_id);
 
-			// read message
-			valread = recv(socket, buffer,DATA_LENGHT, 0);
-			buffer[valread] = '\0';
+            insert_list(my_port, uname, groups[group_id], &group_tail[group_id]);
+        }
+        else if (strncmp(buffer, "/leave", 6) == 0)
+        {
+            char *group_id_str = malloc(sizeof(MAXDATALEN));
+            strcpy(group_id_str, buffer + 7);
+            int group_id = atoi(group_id_str);
+            printf("** %d: %s left group number %d. **\n\n", my_port, uname, group_id);
 
-			// concat message with the name of sender
-			strcat(final_message, clients[id].name);
-			strcat(final_message, " : ");
-			strcat(final_message, buffer);
-			strcat(final_message, "\n");
+            delete_list(my_port, groups[group_id], &group_tail[group_id]);
+        }
+        else if (strncmp(buffer, "/send", 5) == 0)
+        {
+            int space_pos = next_space(buffer + 6);
+            char *group_id_str = malloc(sizeof(MAXDATALEN));
+            strncpy(group_id_str, buffer + 6, space_pos);
+            int group_id = atoi(group_id_str);
 
-			// check if the sender is a member of the group
-			int in_group = 0;
-			for (int k = 0; k < clients[id].last_group_index+1; k++){
-				if (clients[id].groups[k] == group){ // it means the client is a member of the group
+            if (search_list(my_port, groups[group_id], group_tail[group_id]) == -1)
+            {
+                continue;
+            }
 
-					in_group = 1;
-					// now search in all clients and send the message for those with the same group_id in message
-					for (int i = 0; i < CLIENT_NUMBERS; i++){
-						for (int j = 0; j < clients[i].last_group_index+1; j++){
-							if (clients[i].groups[j] == group)
-		 						send(clients[i].socket, final_message, DATA_LENGHT, 0);
-						}
-					}
-				}
-			}
-			if (in_group == 0){
-				printf("%s you're not a member in group with id: %d\n", clients[id].name, group);
-				send(socket, "you're not a member in this group", DATA_LENGHT, 0);
-			}
-		}
-		else if (!strcmp(buffer, "leave")){
+            printf("%s %s\n", uname, buffer);
+            strcpy(msg, uname);
+            x = strlen(msg);
+            strp = msg;
+            strp += x;
+            strcat(strp, buffer + 7 + space_pos);
+            msglen = strlen(msg);
 
-			
-			valread = recv(socket, buffer,DATA_LENGHT, 0);
-			buffer[valread] = '\0';
-			int exist = 0;
-			int deleted_group_index;
-			for (int i = 0; i < clients[id].last_group_index+1; i++)
-			{
-				if(clients[id].groups[i] == atoi(buffer)){
-					exist = 1;
-					deleted_group_index = i;
-					printf("this group is deleted:%d\n", clients[id].groups[i]);
-				}
-			}
-			if(exist == 1){
-				for(int i = deleted_group_index; i<clients[id].last_group_index+1; i++)
-					clients[id].groups[i] = clients[id].groups[i+1];
-				clients[id].last_group_index--;
-			}
-			else{
-				printf("no such a group with id: %d !!\n", atoi(buffer));
-				send(socket, "no such a group", DATA_LENGHT, 0);
-			}
+            for (int i = 0; i < group_tail[group_id]; i++)
+            {
+                if (groups[group_id][i].port != my_port)
+                    send(groups[group_id][i].port, msg, msglen, 0);
+            }
 
-		}
-	}
+            bzero(msg, MAXDATALEN);
+        }
+        display_list(users, user_tail);
+    }
+    return 0;
 }
 
+void *quit_signal()
+{
+    printf("\n==== SHUTTING DOWN SERVER ====\n");
+    notify_shutdown();
+    exit(0);
+}
 
+void notify_shutdown()
+{
+    if (user_tail == 0)
+    {
+        printf("No clients\n");
+        exit(0);
+    }
+    else
+    {
+        for (int i = 0; i < user_tail; i++)
+        {
+            send(users[i].port, "/server_down", 14, 0);
+        }
+
+        printf("%d clients closed\n", user_tail + 1);
+    }
+}
+
+void insert_list(int port, char *username, User *list, int *tail)
+{
+    if (search_list(port, list, *tail) != -1)
+    {
+        return;
+    }
+    User *temp;
+    temp = malloc(sizeof(User));
+    if (temp == NULL)
+        printf("Out of space!");
+    temp->port = port;
+    strcpy(temp->username, username);
+    list[(*tail)++] = *temp;
+}
+
+int search_list(int port, User *list, int tail)
+{
+    for (int i = 0; i < tail; i++)
+    {
+        if (list[i].port == port)
+            return i;
+    }
+    return -1;
+}
+
+void delete_list(int port, User *list, int *tail)
+{
+    int ptr = search_list(port, list, *tail);
+    if (ptr == -1)
+    {
+        return;
+    }
+
+    for (int i = ptr; i < *tail - 1; i++)
+    {
+        list[i] = list[i + 1];
+    }
+    (*tail)--;
+}
+
+void display_list(const User *list, int tail)
+{
+    printf("Current online users:\n");
+    if (tail == 0)
+    {
+        printf("No one is online\n");
+        return;
+    }
+
+    for (int i = 0; i < tail; i++)
+    {
+        printf("%d: %s\t", list[i].port, list[i].username);
+    }
+    printf("\n\n");
+}
+
+void delete_all(User *list, int *tail)
+{
+    *tail = 0;
+}
+
+int next_space(char *str)
+{
+    int i = 0;
+    while (str[i] != '\0')
+    {
+        if (str[i] == ' ')
+        {
+            return i;
+        }
+        i++;
+    }
+    return -1;
+}
